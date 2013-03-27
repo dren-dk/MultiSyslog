@@ -1,0 +1,182 @@
+#!/usr/bin/perl -w
+use strict;
+use IO::Socket;
+use POSIX;
+use FindBin qw($Script $Bin);
+use Fcntl qw(LOCK_EX LOCK_NB LOCK_UN);
+
+# Copyright 2005-2013 Flemming Frandsen.
+# You may use this software under the terms of the BSD license.
+# See: https://github.com/dren-dk/MultiSyslog
+
+# New log files are created here:
+my $ROOT = "/var/log/remote";
+
+# Only log messages from these hosts are stored as individual files, all other messages are rate-limited and logged to bad:
+my @MYNET = (
+	qr/^127\.$/,
+	qr/^10\./,
+	qr/^192\.168\./,
+);
+
+my $MYLOG   = "$ROOT/$Script.log";
+my $PIDFILE = "$ROOT/$Script.pid";
+
+sub logLine {
+
+    my $t = strftime("%Y/%m/%d %H:%M:%S", localtime);
+
+    if (@_ == 2) {
+		my ($fn, $msg) = @_;	
+		open L, ">>$fn" or die "Unable to append to $fn: $!";
+		print L "$t $msg\n";
+		close L;
+    } else {
+		my ($msg) = @_;
+		print "$t $msg\n";
+    }
+}
+
+
+my %hostnames; # Cache build over time from dns
+$SIG{ALRM} = sub {die "timeout"};
+sub lookup {
+    my $ip = shift;
+    return $ip unless $ip=~/^\d+\.\d+\.\d+\.\d+$/;
+
+    unless (exists $hostnames{$ip}) {
+        my @h = ();
+		eval {
+			alarm(2);
+			@h = gethostbyaddr(pack('C4',split('\.',$ip)),2);
+			alarm(0);
+		};
+		$hostnames{$ip} = $h[0] || undef;
+    }
+    return $hostnames{$ip} || $ip;
+}
+
+
+
+
+sub daemonIsRunning() {
+    return 0 unless -f $PIDFILE;
+
+    # Note: The + requests read/write access, this is to make it possible to grab
+    # the exclusive lock on Solaris OSX and Linux both follow the original BSD semantics,
+    # so they work fine with pure read-access to the file.
+    open PID, "+<$PIDFILE" or return 0;
+    my $pid = <PID>;
+    if (flock(PID, LOCK_EX | LOCK_NB)) {
+		$pid = 0 ; # If we can get the lock the the daemon has died.
+		flock(PID, LOCK_UN);
+    }
+    close PID;
+    unlink $PIDFILE unless $pid;
+    return $pid;
+}
+
+my $pid = daemonIsRunning();
+
+my $c = shift @ARGV || '';
+
+if ($c eq 'start') {
+    die "Error: Process is already running with pid: $pid." if $pid;
+
+    # Double fork idiom: avoids leaving a zombie around.
+    if (fork) {
+		print "$Script has been started\n";
+		exit 0;
+    }
+    exit if fork;
+
+    mkdir $ROOT;
+
+    open PID, ">$PIDFILE" or die "Unable to write pid file $PIDFILE: $!";
+    print PID "$$\n";
+    flock(PID, LOCK_EX) or die "Unable to lock the pid file $PIDFILE";
+    # Note: We keep the file open and locked the entire time we are running.
+
+    while (getppid != 1) {
+		sleep 1;
+    }
+    
+    open(STDOUT, ">$MYLOG") or die "Unable to write to $ROOT/$Script.log: $!";
+    open(STDERR, ">&STDOUT") or die "Unable to redirect stderr to stdout: $!";
+    close STDIN;
+    $| = 1;
+
+    logLine("Started with pid: $$");
+	
+    my $sock = IO::Socket::INET->new(
+		LocalPort =>  514,
+		Proto     =>  'udp',
+		) or die "Unable to listen on udp port 514: $@";
+	
+    
+    logLine("Listening on UDP port 514");
+
+    my $msg = '';
+    my $badCount = 0;
+    my $badDown = time;
+    while ($sock->recv($msg, 4096)) {
+		$msg =~ s/\s+$//;
+		
+		my ($port, $ipaddr_packed) = sockaddr_in($sock->peername);
+		my $ip = inet_ntoa($ipaddr_packed);
+		
+		my $ok = 0;
+		for my $rx (@MYNET) {
+			if ($ip =~ $rx) {
+				$ok = 1;
+				last;
+			}
+		}
+
+		if ($badCount > 0) {
+			if (time-$badDown > 60) {
+				$badDown = time;
+				$badCount--;
+			}
+		}
+
+		if ($ok) {
+			my $name = lookup($ip);
+			logLine("$ROOT/$name", $msg);
+		} else {
+			if ($badCount++ < 10) {
+				logLine("$ROOT/bad", "$ip\t$msg");
+			}
+		}	
+    }
+    $sock->close;
+    
+    logLine("Exiting");
+    exit 0;
+
+} elsif ($c eq 'stop') {
+    die "Error: Unable to stop $Script it's not running" unless $pid;
+
+    print STDERR "Shutting down $Script with pid: $pid";
+    kill 2, $pid;
+    while (daemonIsRunning()) {
+		sleep 1;
+		print STDERR ".";
+    }
+    print STDERR " Done\n";
+    unlink $PIDFILE;
+    exit 0;
+
+} elsif ($c eq 'status') {
+    if ($pid) {
+		print STDERR "$Script is running with process id: $pid\n";
+		exit 0;
+    } else {
+		print STDERR "$Script is not running\n";
+		exit 1;
+    }
+
+} else {
+    die "Syntax: $Script (start|stop|status) (not: $c)";
+}
+
